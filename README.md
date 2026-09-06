@@ -127,6 +127,8 @@ These blocks never reach your client as text:
 
 The prompt pins the exact `{"name","arguments"}` schema, and the parser additionally tolerates the flat payload shapes models sometimes emit anyway (e.g. `{"tool":"bash","command":"ls"}` — tool name under `tool`/`tool_name`/`function`, parameters as the remaining top-level keys, or `parameters`/`args` in place of `arguments`), folding them back into proper `tool_calls` instead of leaking the block to the client as text.
 
+**Anti-loop guardrails** — long agent sessions used to drift into re-issuing identical tool calls (or thinking indefinitely) because the prompt replayed history but never told the model which calls were already made. The prompt now carries an `<already_called>` section: a deduplicated, order-preserving list of every call already issued, placed late in the prompt (right before `<current_task>`) where recency weight is highest, plus `<system>` rules (PROGRESS mandate, NEVER REPEAT, task-done → plain-text answer) and a `NO REPEATS` line in the `<output_rules>` final reminder — so the model always has a hard, current state to check against before emitting a call.
+
 Web search is forced off in this mode so tool answers stay deterministic.
 
 ### Debug mode
