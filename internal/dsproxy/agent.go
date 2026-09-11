@@ -22,7 +22,7 @@ const agentToolEnd = "<<<END_TOOL_CALL>>>"
 
 // ── marker tolerance ─────────────────────────────────────────────────────────
 // Models occasionally miscount the angle brackets framing the markers —
-// observed in the wild with deepseek-v4-pro emitting "<<TOOL_CALL>>>" (two
+// observed in the wild with the model emitting "<<TOOL_CALL>>>" (two
 // leading '<') while producing a well-formed "<<<END_TOOL_CALL>>>". An
 // exact-literal matcher silently misses such blocks and the whole tool call
 // leaks to the client as plain content. Both markers are therefore matched
@@ -733,7 +733,7 @@ func SkipLeadingAgentFence(s string) int {
 
 // ── payload tolerance ────────────────────────────────────────────────────────
 // The contract asks the model for {"name": "<tool>", "arguments": {...}}, but
-// models observed in the wild (deepseek-v4-flash/pro) invent their own payload
+// models observed in the wild invent their own payload
 // shapes when the schema is under-specified — most commonly the FLAT form
 // {"tool": "bash", "command": "...", "timeout": 10} where the tool name sits
 // under "tool" and the parameters are the remaining top-level keys. The old
@@ -969,10 +969,21 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 			// so neither can leak as content while split across chunks. A
 			// marker reported incomplete keeps its bytes inside this window,
 			// so nothing here can be part of a future match.
+			//
+			// The cut must not split a multi-byte UTF-8 sequence: every
+			// emitted piece goes straight into json.Marshal, which silently
+			// replaces invalid UTF-8 bytes with U+FFFD — the client would
+			// render garbled text (CJK chars split across two SSE chunks
+			// showed up as 乱码). Trim the keep-window back to the last
+			// rune boundary instead; the bytes belong to the next piece.
 			const keep = agentStreamKeep
 			if len(rest) > keep {
-				content = append(content, rest[:len(rest)-keep])
-				in.offset = len(in.buffer) - keep
+				cut := len(rest) - keep
+				cut = utf8TrimToBoundary(rest, cut)
+				if cut > 0 {
+					content = append(content, rest[:cut])
+					in.offset += cut
+				}
 			}
 			break
 		}
@@ -1013,4 +1024,51 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 
 func isASCIISpace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\v' || b == '\f'
+}
+
+// utf8TrimToBoundary moves cut left to the closest position that does not
+// split a multi-byte UTF-8 sequence, i.e. the emitted prefix s[:cut] ends on
+// a rune boundary. Returns 0 when no safe cut exists within reach (the whole
+// suffix is one incomplete sequence and must stay buffered). ASCII-only
+// buffers (tool calls, markers) are unaffected: every byte is a boundary.
+func utf8TrimToBoundary(s string, cut int) int {
+	if cut <= 0 || cut >= len(s) {
+		return cut
+	}
+	// If a valid rune ends exactly at cut, nothing to fix.
+	if s[cut]&0xC0 != 0x80 && utf8SeqLen(s[cut]) > 0 {
+		return cut
+	}
+	// s[cut] is a continuation byte (or an invalid lead): the sequence
+	// straddles the cut. Find the start of that sequence and cut there.
+	for back := 1; back <= 3 && cut-back >= 0; back++ {
+		pos := cut - back
+		if pos < 0 {
+			break
+		}
+		if s[pos]&0xC0 != 0x80 {
+			// This byte starts a sequence; cutting at pos leaves the whole
+			// sequence for the next piece.
+			return pos
+		}
+	}
+	// Overlong run of continuation bytes / invalid UTF-8: nothing sensible
+	// to preserve — fall back to the original cut.
+	return cut
+}
+
+// utf8SeqLen returns the length of the UTF-8 sequence starting at b (0 if
+// b does not start a valid sequence).
+func utf8SeqLen(b byte) int {
+	switch {
+	case b < 0x80:
+		return 1
+	case b&0xE0 == 0xC0:
+		return 2
+	case b&0xF0 == 0xE0:
+		return 3
+	case b&0xF8 == 0xF0:
+		return 4
+	}
+	return 0
 }

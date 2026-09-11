@@ -60,7 +60,7 @@ func TestFindAgentMarkerVariants(t *testing.T) {
 // ── finished-text parsing ────────────────────────────────────────────────────
 
 // The exact RESPONSE payload reconstructed from the failing debug session
-// (deepseek-v4-pro, "Find my public ip").
+// (live session, "Find my public ip").
 const malformedPayload = "<<TOOL_CALL>>>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"curl -s https://api.ipify.org\"}}\n<<<END_TOOL_CALL>>>"
 
 func TestParseAgentToolCallsTolerantMarkers(t *testing.T) {
@@ -102,7 +102,7 @@ func TestNormalizeAgentFencesTolerantMarkers(t *testing.T) {
 
 // ── payload tolerance ────────────────────────────────────────────────────────
 //
-// Second live failure mode (goal debug session, deepseek-v4-flash, "Find my
+// Second live failure mode (goal debug session, live session, "Find my
 // public ip"): the markers were canonical, but the model invented a FLAT
 // payload shape — {"tool": "bash", "command": ..., "timeout": 10} instead of
 // {"name": ..., "arguments": {...}}. The strict parser accepted the JSON

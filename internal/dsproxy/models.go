@@ -6,9 +6,13 @@ import (
 )
 
 // ============== MODEL REGISTRY ==============
-// The served models are real configuration, not display labels: each entry
-// maps to a "model_type" value POSTed to DeepSeek's /chat/completion and
-// carries the capability set the proxy enforces before any upstream call.
+// The served model is real configuration, not a display label: it maps to the
+// "model_type" value POSTed to DeepSeek's /chat/completion and carries the
+// capability set the proxy enforces before any upstream call.
+//
+// As of DeepSeek v4.1 the upstream backend serves a single model,
+// deepseek-v4.1-flash, which supports both thinking and web search and is
+// selected with model_type "default" — no other model_type exists anymore.
 
 // ModelType is the value sent upstream as "model_type" in the
 // /chat/completion JSON body. It selects the backend model class on
@@ -16,10 +20,9 @@ import (
 type ModelType string
 
 const (
-	// ModelTypeDefault is sent for deepseek-v4-flash requests.
+	// ModelTypeDefault is the only model_type the v4.1 backend accepts; it
+	// serves deepseek-v4.1-flash (thinking + search capable).
 	ModelTypeDefault ModelType = "default"
-	// ModelTypeExpert is sent for deepseek-v4-pro requests.
-	ModelTypeExpert ModelType = "expert"
 )
 
 // Model describes one OpenAI-facing model and how it maps onto the DeepSeek
@@ -36,18 +39,11 @@ type Model struct {
 // serves. Order defines the /v1/models listing order.
 var modelRegistry = []Model{
 	{
-		ID:             "deepseek-v4-flash",
+		ID:             "deepseek-v4.1-flash",
 		Type:           ModelTypeDefault,
 		SupportsSearch: true,
 		SupportsThink:  true,
 		IsDefault:      true,
-	},
-	{
-		ID:             "deepseek-v4-pro",
-		Type:           ModelTypeExpert,
-		SupportsSearch: false, // pro is reasoning-only: no web search
-		SupportsThink:  true,
-		IsDefault:      false,
 	},
 }
 

@@ -29,54 +29,42 @@ func mustModel(t *testing.T, id string) dsproxy.Model {
 	return m
 }
 
-// TestRegistryPinsTheTwoModels locks down the served model set and each
-// model's capabilities and upstream model_type mapping.
-func TestRegistryPinsTheTwoModels(t *testing.T) {
-	// Pin the wire values of the model_type constants.
+// TestRegistryPinsTheSingleModel locks down the served model set and its
+// capabilities and upstream model_type mapping (deepseek v4.1 serves exactly
+// one model; the "expert" class no longer exists).
+func TestRegistryPinsTheSingleModel(t *testing.T) {
+	// Pin the wire value of the model_type constant.
 	if got := string(dsproxy.ModelTypeDefault); got != "default" {
 		t.Errorf("ModelTypeDefault = %q, want \"default\"", got)
 	}
-	if got := string(dsproxy.ModelTypeExpert); got != "expert" {
-		t.Errorf("ModelTypeExpert = %q, want \"expert\"", got)
+
+	ids := dsproxy.SupportedModelIDs()
+	if len(ids) != 1 || ids[0] != "deepseek-v4.1-flash" {
+		t.Fatalf("expected exactly one supported model (deepseek-v4.1-flash), got %v", ids)
 	}
 
-	if got := dsproxy.SupportedModelIDs(); len(got) != 2 {
-		t.Fatalf("expected exactly 2 supported models, got %v", got)
-	}
-
-	flash := mustModel(t, "deepseek-v4-flash")
+	flash := mustModel(t, "deepseek-v4.1-flash")
 	if !flash.IsDefault {
-		t.Error("deepseek-v4-flash must be the default model")
+		t.Error("deepseek-v4.1-flash must be the default model")
 	}
 	if flash.Type != dsproxy.ModelTypeDefault {
-		t.Errorf("flash model_type = %q, want \"default\"", flash.Type)
+		t.Errorf("v4.1-flash model_type = %q, want \"default\"", flash.Type)
 	}
 	if !flash.SupportsSearch {
-		t.Error("flash must support web search")
+		t.Error("deepseek-v4.1-flash must support web search")
 	}
 	if !flash.SupportsThink {
-		t.Error("flash must support reasoning")
-	}
-
-	pro := mustModel(t, "deepseek-v4-pro")
-	if pro.Type != dsproxy.ModelTypeExpert {
-		t.Errorf("pro model_type = %q, want \"expert\"", pro.Type)
-	}
-	if pro.SupportsSearch {
-		t.Error("pro must NOT support web search")
-	}
-	if !pro.SupportsThink {
-		t.Error("pro must support reasoning")
+		t.Error("deepseek-v4.1-flash must support reasoning")
 	}
 }
 
 // TestResolveModel covers defaulting, case/whitespace tolerance and the
 // unknown-model error.
 func TestResolveModel(t *testing.T) {
-	if m := mustModel(t, ""); m.ID != "deepseek-v4-flash" {
+	if m := mustModel(t, ""); m.ID != "deepseek-v4.1-flash" {
 		t.Errorf("empty model must resolve to the default, got %q", m.ID)
 	}
-	if m := mustModel(t, "  DeepSeek-V4-Pro  "); m.ID != "deepseek-v4-pro" {
+	if m := mustModel(t, "  DeepSeek-V4.1-Flash  "); m.ID != "deepseek-v4.1-flash" {
 		t.Errorf("matching must be case-insensitive/trimmed, got %q", m.ID)
 	}
 
@@ -84,35 +72,36 @@ func TestResolveModel(t *testing.T) {
 	if err == nil {
 		t.Fatal("legacy name deepseek-chat must no longer resolve")
 	}
-	for _, want := range []string{"deepseek-chat", "deepseek-v4-flash", "deepseek-v4-pro"} {
+	for _, want := range []string{"deepseek-chat", "deepseek-v4.1-flash"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q must mention %q", err.Error(), want)
 		}
 	}
+
+	// The retired v4 model ids must be rejected too.
+	for _, gone := range []string{"deepseek-v4-flash", "deepseek-v4-pro"} {
+		if _, err := dsproxy.ResolveModel(gone); err == nil {
+			t.Errorf("retired model %q must no longer resolve", gone)
+		}
+	}
 }
 
-// TestValidateCapabilities pins the reasoning-only restriction of pro.
+// TestValidateCapabilities: the single model supports search and reasoning.
 func TestValidateCapabilities(t *testing.T) {
-	pro := mustModel(t, "deepseek-v4-pro")
-	flash := mustModel(t, "deepseek-v4-flash")
+	flash := mustModel(t, "deepseek-v4.1-flash")
 
-	if err := pro.ValidateCapabilities(true); err == nil {
-		t.Fatal("pro + search must be rejected")
-	} else if !strings.Contains(err.Error(), "deepseek-v4-flash") {
-		t.Errorf("rejection should point at the search-capable model: %v", err)
-	}
-	if err := pro.ValidateCapabilities(false); err != nil {
-		t.Errorf("pro without search must pass: %v", err)
-	}
 	if err := flash.ValidateCapabilities(true); err != nil {
-		t.Errorf("flash + search must pass: %v", err)
+		t.Errorf("v4.1-flash + search must pass: %v", err)
+	}
+	if err := flash.ValidateCapabilities(false); err != nil {
+		t.Errorf("v4.1-flash without search must pass: %v", err)
 	}
 }
 
 // TestProxyModelsAdvertisesRegistry verifies /v1/models data is generated
 // from the registry (and stays free of removed legacy entries).
 func TestProxyModelsAdvertisesRegistry(t *testing.T) {
-	want := map[string]bool{"deepseek-v4-flash": false, "deepseek-v4-pro": false}
+	want := map[string]bool{"deepseek-v4.1-flash": false}
 	for _, m := range dsproxy.ProxyModels {
 		id, _ := m["id"].(string)
 		if _, ok := want[id]; !ok {
@@ -129,8 +118,8 @@ func TestProxyModelsAdvertisesRegistry(t *testing.T) {
 			t.Errorf("model %q missing from /v1/models payload", id)
 		}
 	}
-	if len(dsproxy.ProxyModels) != 2 {
-		t.Fatalf("expected exactly 2 advertised models, got %d", len(dsproxy.ProxyModels))
+	if len(dsproxy.ProxyModels) != 1 {
+		t.Fatalf("expected exactly 1 advertised model, got %d", len(dsproxy.ProxyModels))
 	}
 }
 
@@ -144,8 +133,7 @@ func TestBuildChatCompletionBody(t *testing.T) {
 		modelType string
 		want      string
 	}{
-		{"flash maps to default", "default", "default"},
-		{"pro maps to expert", "expert", "expert"},
+		{"v4.1-flash maps to default", "default", "default"},
 		{"empty falls back to default", "", "default"},
 	}
 	for _, tc := range cases {
@@ -162,19 +150,19 @@ func TestBuildChatCompletionBody(t *testing.T) {
 		}
 	}
 
-	pro := dsproxy.BuildChatCompletionBody(dsproxy.ChatParams{
+	body := dsproxy.BuildChatCompletionBody(dsproxy.ChatParams{
 		ChatSessionID:   "sess",
 		Prompt:          "hi",
-		ModelType:       "expert",
+		ModelType:       "default",
 		ThinkingEnabled: true,
 	})
-	if pro["thinking_enabled"] != true {
+	if body["thinking_enabled"] != true {
 		t.Error("thinking_enabled must be forwarded")
 	}
-	if v, ok := pro["parent_message_id"]; !ok || v != nil {
+	if v, ok := body["parent_message_id"]; !ok || v != nil {
 		t.Errorf("absent parent must serialize as null, got %v (ok=%v)", v, ok)
 	}
-	if _, ok := pro["ref_file_ids"]; !ok {
+	if _, ok := body["ref_file_ids"]; !ok {
 		t.Error("ref_file_ids must stay present")
 	}
 }
@@ -205,9 +193,10 @@ func errorCode(t *testing.T, resp map[string]any) string {
 }
 
 // TestHandleChatRejectsUnknownModel: an unregistered model id fails fast with
-// model_not_found before any upstream session/PoW work happens.
+// model_not_found before any upstream session/PoW work happens — including
+// the retired v4 ids.
 func TestHandleChatRejectsUnknownModel(t *testing.T) {
-	for _, model := range []string{"deepseek-chat", "deepseek-reasoner", "gpt-4o", "gibberish"} {
+	for _, model := range []string{"deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro", "gpt-4o", "gibberish"} {
 		rec, resp := postChat(t, `{"model":"`+model+`","messages":[{"role":"user","content":"hi"}]}`)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("model %q: status = %d, want 400 (body: %s)", model, rec.Code, rec.Body.String())
@@ -218,25 +207,23 @@ func TestHandleChatRejectsUnknownModel(t *testing.T) {
 	}
 }
 
-// TestHandleChatRejectsProWithSearch: deepseek-v4-pro is reasoning-only, so
-// search:true is refused instead of being silently downgraded.
-func TestHandleChatRejectsProWithSearch(t *testing.T) {
-	rec, resp := postChat(t,
-		`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"search":true}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
-	}
-	if got := errorCode(t, resp); got != "model_capability" {
-		t.Errorf("error code = %q, want model_capability", got)
-	}
-	msg, _ := resp["error"].(map[string]any)["message"].(string)
-	if !strings.Contains(msg, "deepseek-v4-pro") {
-		t.Errorf("error message should name the offending model: %q", msg)
+// TestHandleChatAcceptsV41Flash: the served model (and a missing model field,
+// which defaults to it) passes validation and reaches the upstream path
+// (failing only on the missing test token, never on model resolution).
+func TestHandleChatAcceptsV41Flash(t *testing.T) {
+	for _, model := range []string{"deepseek-v4.1-flash", ""} {
+		rec, resp := postChat(t, `{"model":"`+model+`","messages":[{"role":"user","content":"hi"}]}`)
+		if rec.Code == http.StatusBadRequest {
+			t.Errorf("model %q: rejected with %q (model validation must pass)", model, errorCode(t, resp))
+		}
+		if got := errorCode(t, resp); got == "model_not_found" {
+			t.Errorf("model %q: must not be model_not_found", model)
+		}
 	}
 }
 
-// TestModelsEndpointListsNewRegistry checks GET /v1/models serves the two
-// rebuilt models.
+// TestModelsEndpointListsNewRegistry checks GET /v1/models serves the
+// v4.1-flash model.
 func TestModelsEndpointListsNewRegistry(t *testing.T) {
 	srv := dsproxy.NewProxyServer(discardLogger(), "")
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -255,10 +242,13 @@ func TestModelsEndpointListsNewRegistry(t *testing.T) {
 	for _, m := range resp.Data {
 		ids[m.ID] = true
 	}
-	if !ids["deepseek-v4-flash"] || !ids["deepseek-v4-pro"] {
-		t.Fatalf("/v1/models must list both new models, got %v", ids)
+	if !ids["deepseek-v4.1-flash"] {
+		t.Fatalf("/v1/models must list deepseek-v4.1-flash, got %v", ids)
 	}
-	if ids["deepseek-chat"] {
-		t.Error("legacy deepseek-chat must be gone from /v1/models")
+	if ids["deepseek-v4-flash"] || ids["deepseek-v4-pro"] || ids["deepseek-chat"] {
+		t.Error("retired models must be gone from /v1/models")
+	}
+	if len(ids) != 1 {
+		t.Errorf("expected exactly 1 model, got %v", ids)
 	}
 }

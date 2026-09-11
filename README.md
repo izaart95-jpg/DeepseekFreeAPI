@@ -15,7 +15,7 @@
 - Cloudflare protection detection with automatic retry
 - Proof of Work (PoW) challenge solving — WASM run in-process via wazero
 - OpenAI-compatible proxy server
-- **Real model registry** — `deepseek-v4-flash` (default) and `deepseek-v4-pro`; the selected model changes the actual upstream request (`model_type: "default"` vs `"expert"`) and gates capabilities (pro is reasoning-only, no web search)
+- **Real model registry** — `deepseek-v4.1-flash` (default, thinking + web search); the id maps to the actual upstream request (`model_type: "default"` — the v4.1 backend has no other model class)
 - Cookie management (loads `cookies.json`)
 - Streaming and non-streaming responses
 - Threaded conversation support
@@ -131,6 +131,8 @@ The prompt pins the exact `{"name","arguments"}` schema, and the parser addition
 
 Web search is forced off in this mode so tool answers stay deterministic.
 
+**Streaming is UTF-8 safe** — the interceptor holds back a small window of un-flushed text (so a tool-call marker split across chunks can't leak). That window used to be cut at a raw byte offset, which could slice a multi-byte character in two; each half then went through JSON encoding, which replaces invalid UTF-8 with U+FFFD — CJK text came out garbled (乱码) in streaming mode while non-streaming stayed clean. The cut now lands on a rune boundary, so every emitted delta is valid UTF-8 (covered by regression tests in `internal/dsproxy/agent_utf8_test.go`).
+
 ### Debug mode
 
 Enable with `--debug` or `DEBUG=1|true|yes|on`. Every exchange is printed to stderr: client requests (method/path/headers/body), upstream requests to DeepSeek (URL/headers/cookies/body), upstream responses (status/headers/body), streaming SSE frames both ways, PoW challenge + solution, and parsed agent tool calls. Bodies longer than 4 KB are truncated.
@@ -170,32 +172,30 @@ curl -X POST http://localhost:3000/new \
 
 ### Models
 
-The proxy serves two models. The choice is real configuration: it selects the `model_type` sent to DeepSeek's `/chat/completion` and gates what the request may use.
+The proxy serves a single model, `deepseek-v4.1-flash` (the DeepSeek v4.1 backend no longer has model classes — `model_type` is always `"default"`). The id is real configuration: it selects the `model_type` sent to DeepSeek's `/chat/completion` and gates what the request may use.
 
 | model | sent upstream as | web search | reasoning (`reasoning` / `reasoning_effort`) |
 |---|---|---|---|
-| `deepseek-v4-flash` *(default)* | `"model_type": "default"` | ✅ | ✅ |
-| `deepseek-v4-pro` | `"model_type": "expert"` | ❌ refused (400) | ✅ |
+| `deepseek-v4.1-flash` *(default)* | `"model_type": "default"` | ✅ | ✅ |
 
 Rules:
 
-- Omitting `model` resolves to `deepseek-v4-flash`.
-- Any other model id is rejected with `400 model_not_found`.
-- `deepseek-v4-pro` with `"search": true` is rejected with `400 model_capability` instead of being silently downgraded.
+- Omitting `model` resolves to `deepseek-v4.1-flash`.
+- Any other model id (including the retired `deepseek-v4-flash` / `deepseek-v4-pro`) is rejected with `400 model_not_found`.
 - When thinking is enabled, the reasoning trace is returned separately as `reasoning_content` (streaming: `delta.reasoning_content`; non-streaming: `message.reasoning_content`) — it never mixes into `content`.
 
 ### `POST /v1/chat/completions` — Chat completions (OpenAI format)
 
 Thinking mode stays **off** unless the request payload contains `"reasoning": {"enabled": true}` or a `"reasoning_effort"` value — the model name alone never enables it.
 
-**Non-streaming with thinking + search (flash):**
+**Non-streaming with thinking + search:**
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer Waguri" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-flash",
+    "model": "deepseek-v4.1-flash",
     "messages": [{"role": "user", "content": "What is the latest news about AI?"}],
     "reasoning": {"enabled": true},
     "search": true,
@@ -203,14 +203,14 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
-**Streaming with the reasoning model (pro):**
+**Streaming with thinking:**
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer Waguri" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-pro",
+    "model": "deepseek-v4.1-flash",
     "messages": [{"role": "user", "content": "Explain quantum computing in simple terms"}],
     "reasoning_effort": "high",
     "stream": true
@@ -233,7 +233,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer Waguri" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-flash",
+    "model": "deepseek-v4.1-flash",
     "messages": [{"role": "user", "content": "My name is John"}],
     "search": false,
     "stream": false
@@ -244,7 +244,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer Waguri" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-flash",
+    "model": "deepseek-v4.1-flash",
     "messages": [{"role": "user", "content": "What is my name?"}],
     "search": false,
     "stream": false

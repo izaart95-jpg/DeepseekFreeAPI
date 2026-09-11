@@ -39,12 +39,12 @@ func chunkText(chunks []Chunk, chunkType string) string {
 	return b.String()
 }
 
-// TestParseExpertThinkingStream mirrors the live expert protocol: a THINK
+// TestParseThinkingStream mirrors the live thinking protocol: a THINK
 // tail fragment receives incremental appends, then a full RESPONSE fragment
 // is appended with the final answer.
-func TestParseExpertThinkingStream(t *testing.T) {
+func TestParseThinkingStream(t *testing.T) {
 	chunks := feedEvents(t, []string{
-		`{"request_message_id":1,"response_message_id":2,"model_type":"expert"}`,
+		`{"request_message_id":1,"response_message_id":2,"model_type":"default"}`,
 		`{"v":{"response":{"message_id":2,"role":"ASSISTANT","thinking_enabled":true,"status":"WIP","fragments":[{"id":2,"type":"THINK","content":"We"}]}}}`,
 		`{"p":"response/fragments/-1/content","o":"APPEND","v":" need"}`,
 		`{"v":" answer"}`,

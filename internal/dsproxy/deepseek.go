@@ -121,8 +121,8 @@ func (c *DeepSeekAPI) refreshCookies() {
 
 // baseHeaders mirrors the current chat.deepseek.com web client (Chrome/149,
 // x-client-version 2.4.0). The old "x-app-version" header is gone from the
-// protocol, and stale version headers make the backend reject Expert
-// ("model_type":"expert") with unsupported_client_by_model.
+// protocol, and stale version headers used to make the backend reject
+// requests with unsupported_client_by_model.
 func (c *DeepSeekAPI) baseHeaders(powResponse string) http.Header {
 	h := http.Header{}
 	h.Set("accept", "*/*")
@@ -319,8 +319,9 @@ type ChatParams struct {
 	ParentMessageID any
 	ThinkingEnabled bool
 	SearchEnabled   bool
-	// ModelType selects the backend model class on chat.deepseek.com
-	// ("default" or "expert"). Empty resolves to "default".
+	// ModelType selects the backend model class on chat.deepseek.com.
+	// v4.1 serves a single class: "default" (deepseek-v4.1-flash). Empty
+	// resolves to "default".
 	ModelType string
 }
 

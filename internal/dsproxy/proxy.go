@@ -254,10 +254,10 @@ type reasoningOptions struct {
 }
 
 // ChatRequest mirrors the OpenAI-style request body. "model" resolves against
-// the registry in models.go — "deepseek-v4-flash" (default) or
-// "deepseek-v4-pro"; anything else is a 400. Thinking is NOT inferred from the
-// model name or legacy flags: it is enabled only when the payload carries
-// "reasoning": {"enabled": true} or a "reasoning_effort" string.
+// the registry in models.go — "deepseek-v4.1-flash" (default); anything else
+// is a 400. Thinking is NOT inferred from the model name or legacy flags: it
+// is enabled only when the payload carries "reasoning": {"enabled": true} or
+// a "reasoning_effort" string.
 type ChatRequest struct {
 	Messages        []chatMessage     `json:"messages"`
 	Model           string            `json:"model"`
