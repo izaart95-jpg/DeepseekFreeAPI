@@ -7,25 +7,32 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
 
 // Run loads .env (real environment variables always win), applies the
-// --debug/--agent-mode/--sync-mode flags and DEBUG/AGENT_MODE/SYNC_MODE
-// variables, then starts the OpenAI-compatible proxy server.
+// --debug/--agent-mode/--sync-mode/--legacy-pool flags and DEBUG/AGENT_MODE/
+// SYNC_MODE/SESSION_FLOW variables, then starts the OpenAI-compatible proxy.
 //
-// By default stateless (history=false) requests run through the async
-// session-pool flow: a standing batch of ready sessions is pre-made at
-// startup, handed out instantly, and refilled as requests complete.
-// --sync-mode restores the legacy synchronous flow where every request
-// creates its own session first.
+// Stateless (history=false) requests run through the stealth reuse flow by
+// default: ONE session, created lazily on the first request and reused via
+// /chat/edit_message, so there is no startup burst of session creations and
+// no create/delete churn per request — the traffic pattern DeepSeek's bot
+// detector was flagging.
+//
+// Backward compatibility:
+//   - --sync-mode / SYNC_MODE=true       -> legacy one-session-per-request
+//   - --legacy-pool / SESSION_FLOW=pool  -> legacy pre-warmed session batch
+//   - SESSION_FLOW=stealth (default)     -> this new flow (explicit)
 func Run() {
 	envFile := loadDotEnv()
 
 	debugMode = false
 	agentMode = false
 	syncMode := false
+	legacyPool := false
 	for _, arg := range os.Args[1:] {
 		switch arg {
 		case "--debug":
@@ -34,6 +41,8 @@ func Run() {
 			agentMode = true
 		case "--sync-mode":
 			syncMode = true
+		case "--legacy-pool":
+			legacyPool = true
 		}
 	}
 	if boolEnv("DEBUG") {
@@ -43,6 +52,17 @@ func Run() {
 		agentMode = true
 	}
 	if boolEnv("SYNC_MODE") {
+		syncMode = true
+	}
+
+	// SESSION_FLOW picks the stateless flow explicitly (env-var form of
+	// the mode flags; the flags win when both are given).
+	switch strings.ToLower(strings.TrimSpace(envOr("SESSION_FLOW", ""))) {
+	case "stealth", "reuse", "edit":
+		// nothing: this is the default
+	case "pool", "legacy-pool", "async":
+		legacyPool = true
+	case "sync", "legacy", "per-request":
 		syncMode = true
 	}
 
@@ -71,10 +91,16 @@ func Run() {
 
 	proxy := NewProxyServer(logger, proxyKey)
 
+	// The reuse manager owns the single lazily-created stateless session.
+	// It exists in every mode (cheap), but only the stealth flow uses it.
+	reuse := NewReuseManager(logger, &lazyReuseBackend{s: proxy})
+
 	var pool *SessionPool
-	if syncMode {
-		logger.Printf("  Mode      : sync (--sync-mode: one session created per request)")
-	} else {
+	switch {
+	case syncMode:
+		proxy.EnableSyncFlow()
+		logger.Printf("  Flow      : sync (--sync-mode: legacy, one session created per request)")
+	case legacyPool:
 		poolSize := intEnvOr("SESSION_POOL_SIZE", defaultPoolSize)
 		waitSecs := intEnvOr("SESSION_ACQUIRE_TIMEOUT", int(defaultPoolWait/time.Second))
 		proxy.poolWait = time.Duration(waitSecs) * time.Second
@@ -83,8 +109,12 @@ func Run() {
 		}
 		pool = NewSessionPool(logger, &lazyBackend{s: proxy}, poolSize)
 		proxy.AttachSessionPool(pool)
-		logger.Printf("  Mode      : async (pre-made session batch x%d, history=false only)", pool.Size())
+		logger.Printf("  Flow      : legacy pool (pre-made session batch x%d)", pool.Size())
 		logger.Printf("              SESSION_POOL_SIZE=%d SESSION_ACQUIRE_TIMEOUT=%ds", pool.Size(), waitSecs)
+	default:
+		proxy.AttachReuseManager(reuse)
+		logger.Printf("  Flow      : stealth reuse (1 lazy session, /chat/edit_message reuse)")
+		logger.Printf("              anti-detection default; --legacy-pool or --sync-mode restores old behavior")
 	}
 
 	logger.Printf("  Endpoints : POST /v1/chat/completions")
@@ -103,8 +133,9 @@ func Run() {
 		serveErr <- server.ListenAndServe()
 	}()
 
-	// Warm the standing session batch in the background; requests are served
-	// meanwhile (they simply queue on Acquire until sessions appear).
+	// The stealth flow warms nothing at boot (its session is created lazily
+	// on the first request — a boot burst is a bot signature). Only the
+	// legacy pool pre-warms its standing batch.
 	if pool != nil {
 		pool.Start()
 	}
@@ -132,11 +163,13 @@ func Run() {
 		}
 		cancel()
 
-		// Clear any sessions still pooled so nothing is left behind on the
-		// DeepSeek account (checked-out ones are deleted by their own Release).
+		// Clear whatever stateless sessions the active flow still holds so
+		// nothing is left behind on the DeepSeek account (in-flight requests
+		// retire their own sessions through their lease/Release).
 		if pool != nil {
 			pool.Shutdown()
 		}
+		reuse.Shutdown()
 		logger.Printf("All sessions cleared. Goodbye.")
 	}
 }

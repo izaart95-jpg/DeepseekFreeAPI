@@ -19,9 +19,8 @@
 - Cookie management (loads `cookies.json`)
 - Streaming and non-streaming responses
 - Threaded conversation support
-- **Session garbage collector** — with history disabled, every request runs on a throwaway chat session that is deleted on DeepSeek right after use, so session IDs never accumulate on the account
-- **Async session-pool mode (default)** — a standing batch of 3 pre-made sessions is kept warm at all times; stateless requests grab one instantly instead of paying per-request creation latency, and each consumed session is deleted upstream + replaced the moment its response is fully processed. `--sync-mode` restores the legacy synchronous flow
-- **Graceful shutdown** — CTRL+C drains in-flight requests, then clears every remaining pooled session on DeepSeek before exiting (a second CTRL+C force-exits)
+- **Stealth session-reuse flow (default)** — with history disabled, all stateless traffic rides ONE lazily-created chat session; every request re-edits the same user message through `POST /chat/edit_message` (DeepSeek's own edit feature), so no conversation context ever accumulates and there is no per-request session create/delete churn — the traffic pattern that was getting accounts suspended for "bot-like behavior". The session rotates (deleted upstream, one fresh session lazily created) only when its edit budget (~6 edits per message) runs out. `--legacy-pool` / `SESSION_FLOW=pool` restores the old pre-warmed batch flow, `--sync-mode` / `SESSION_FLOW=sync` the legacy one-session-per-request flow
+- **Graceful shutdown** — CTRL+C drains in-flight requests, then clears every remaining session on DeepSeek before exiting (a second CTRL+C force-exits)
 - **Agent mode** (`--agent-mode` / `AGENT_MODE=true`) — OpenAI function/tool calling translated into a single role-tagged prompt; model tool-call blocks are parsed back into OpenAI `tool_calls`
 - **Debug mode** (`--debug` / `DEBUG=true`) — prints every request/response headers and bodies in both directions, PoW challenges, SSE frames and session IDs
 
@@ -89,26 +88,42 @@ DEEPSEEK_TOKEN=<token> AGENT_MODE=true ./deepseek-proxy proxy
 # or: ./deepseek-proxy --agent-mode proxy
 ```
 
-### Sync vs async session flow
+### Stateless session flow (history disabled)
 
-By default, stateless traffic (`/history` disabled) runs through the **async** flow:
+By default, stateless traffic (`/history` disabled) runs through the **stealth reuse** flow:
 
-- At startup the proxy **pre-makes a standing batch of 5 chat sessions** so completion requests never wait on per-request session creation.
-- Each request takes a ready session from the batch instantly; multiple concurrent requests are served in parallel up to the batch size.
-- Only after a response has been **fully written and processed** is that consumed session deleted upstream (`POST /chat_session/delete`) and a replacement created immediately — the batch refills itself for as long as the app runs.
-- If a burst exhausts the batch, extra requests wait up to `SESSION_ACQUIRE_TIMEOUT` seconds (default 10) and then create a session directly instead of stalling; those still go through the garbage collector afterwards.
+- Nothing is created at startup. The first request lazily creates ONE chat session — indistinguishable from a user opening a new chat.
+- Every following request POSTs `chat/edit_message`, re-editing the *first* user message of that session. Each edit replaces the previous prompt, so the conversation stays a single root exchange forever: the model has no memory of earlier requests (exactly the stateless semantics `/history=false` promises) while the account never sees session create/delete churn per request.
+- Requests are serialized (one generation in flight, like a browser user); concurrent requests queue briefly behind the current one.
+- DeepSeek caps edits of one message (observed budget: 6). When the budget runs out — the stream reports `ban_edit`, or an edit is rejected — the used session is deleted upstream and the **next** request lazily creates a fresh one. Again: a single, human-paced call, never a burst.
+- If an edit fails because the session no longer exists server-side, the flow rotates automatically and retries on a fresh session, so a stale session can never poison later requests.
 
 ```bash
-# tune the async flow (optional)
+# the stealth flow is the default; nothing to configure
+SESSION_FLOW=stealth   # explicit (same as default)
+```
+
+#### Legacy flows (backward compatibility)
+
+The two older behaviors remain fully available via flags or `SESSION_FLOW`:
+
+- **`--legacy-pool`** (or `SESSION_FLOW=pool`) — the pre-warmed session batch: a standing batch of sessions is created at startup (boot burst), each request takes one, and each consumed session is deleted + replaced after its response completes. Tunables: `SESSION_POOL_SIZE=5`, `SESSION_ACQUIRE_TIMEOUT=10`.
+- **`--sync-mode`** (or `SESSION_FLOW=sync`, `SYNC_MODE=true`) — the original synchronous flow: every request creates its own session, completes, then the session is garbage-collected.
+
+```bash
+./deepseek-proxy --legacy-pool          # or SESSION_FLOW=pool
+./deepseek-proxy --sync-mode            # or SESSION_FLOW=sync / SYNC_MODE=true
+
+# legacy pool tuning (pool flow only)
 SESSION_POOL_SIZE=5            # standing ready-session batch size
 SESSION_ACQUIRE_TIMEOUT=10     # seconds to wait for a pooled session (0 = forever)
 ```
 
-For backward compatibility, `--sync-mode` (or `SYNC_MODE=true`) restores the legacy synchronous flow: every request creates its own session first, then completes, then the session is garbage-collected — one request at a time per client, no pre-warming.
+> ⚠️ The legacy pool flow recreates the exact traffic pattern DeepSeek was flagging (boot-time burst of session creations + per-request create/delete churn). It is kept only for backward compatibility.
 
 ### Graceful shutdown
 
-Pressing CTRL+C (or sending SIGTERM) stops the proxy respectfully: it stops accepting new connections, lets in-flight responses finish (10s drain deadline), prints `clearing all sessions...`, deletes every remaining pooled session on DeepSeek so nothing is left behind, and only then exits. A second CTRL+C force-exits immediately.
+Pressing CTRL+C (or sending SIGTERM) stops the proxy respectfully: it stops accepting new connections, lets in-flight responses finish (10s drain deadline), prints `clearing all sessions...`, deletes every remaining session on DeepSeek (the reuse flow's live session and any pooled sessions) so nothing is left behind, and only then exits. A second CTRL+C force-exits immediately.
 
 ### Agent mode
 
@@ -161,7 +176,7 @@ curl -X POST http://localhost:3000/history \
   -d '{"enable": false}'
 ```
 
-> 🧹 **Garbage collector:** with history disabled, each request gets a throwaway chat session. As soon as the response is done, the proxy asynchronously deletes that session upstream (`POST /chat_session/delete`) — so your DeepSeek account doesn't fill up with dead session IDs. In the default async mode the deleted session is instantly replaced from a pre-made batch; sessions created in history-enabled mode are never deleted, and rotating via `POST /new` also collects the session it replaces.
+> 🧹 **Stateless semantics:** with history disabled, requests are stateless by design — the stealth reuse flow implements this via `chat/edit_message` (each request replaces the previous prompt on a shared session, so no context accumulates), while the legacy flows used throwaway sessions deleted after each request (`POST /chat_session/delete`). Sessions created in history-enabled mode are never deleted, and rotating via `POST /new` also collects the session it replaces.
 
 ### `POST /new` — Create a new session
 

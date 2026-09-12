@@ -30,22 +30,53 @@ type ProxyServer struct {
 	histParID  any
 	useHistory bool
 
-	// Async mode (history=false only): pool != nil enables the pre-warmed
-	// session-pool flow. It is attached once at startup, before serving.
-	pool *SessionPool
+	// sessionFlow selects how stateless (history=false) requests get a chat
+	// session upstream. Exactly one of the three mode handles is non-nil.
+	sessionFlow SessionFlow
+
+	// activeLease is the reuse lease whose stream events are currently in
+	// flight (stealth flow). Requests are serialized by the reuse manager,
+	// so one at a time owns this.
+	activeLease *Lease
+
 	// poolWait bounds how long a request waits for a pooled session before
-	// falling back to creating one directly (0 waits forever).
+	// falling back to creating one directly (0 waits forever). Legacy pool
+	// flow only.
 	poolWait time.Duration
 }
 
+// SessionFlow is the per-mode state for stateless session handling.
+type SessionFlow struct {
+	// Stealth is the anti-detection reuse flow (default): one lazily created
+	// session, reused via /chat/edit_message, rotated after the edit budget.
+	Stealth *ReuseManager
+	// Pool is the legacy pre-warmed session pool (--legacy-pool).
+	Pool *SessionPool
+	// Sync is the legacy one-session-per-request flow (--sync-mode).
+	Sync bool
+}
+
+// NewProxyServer builds the server; AttachReuseManager / AttachSessionPool
+// select the stateless flow afterwards (exactly one, set once by Run).
 func NewProxyServer(logger *log.Logger, proxyKey string) *ProxyServer {
 	return &ProxyServer{log: logger, proxyKey: proxyKey, poolWait: defaultPoolWait}
 }
 
-// AttachSessionPool switches the history=false path to the async flow backed
-// by a pre-warmed session pool. Must be called before the server starts.
+// AttachReuseManager switches the history=false path to the stealth reuse
+// flow. Must be called before the server starts serving.
+func (s *ProxyServer) AttachReuseManager(m *ReuseManager) {
+	s.sessionFlow.Stealth = m
+}
+
+// AttachSessionPool switches the history=false path to the legacy pre-warmed
+// session-pool flow. Must be called before the server starts serving.
 func (s *ProxyServer) AttachSessionPool(p *SessionPool) {
-	s.pool = p
+	s.sessionFlow.Pool = p
+}
+
+// EnableSyncFlow restores the legacy synchronous per-request flow.
+func (s *ProxyServer) EnableSyncFlow() {
+	s.sessionFlow.Sync = true
 }
 
 func (s *ProxyServer) getAPI() (*DeepSeekAPI, error) {
@@ -341,17 +372,30 @@ func (s *ProxyServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Streaming needs a flusher; bail before touching any upstream state if
+	// this connection can't stream (e.g. wrapped in a non-flushing writer).
+	if stream {
+		if _, ok := w.(http.Flusher); !ok {
+			writeError(w, "Streaming unsupported", "server_error", nil, 500)
+			return
+		}
+	}
+
 	api, err := s.getAPI()
 	if err != nil {
 		writeError(w, err.Error(), "authentication_error", "missing_token", 401)
 		return
 	}
 
-	var chatID string
-	var parID any
-	// pooled marks sessions owned by the session pool (async mode); they are
-	// retired through pool.Release, everything else keeps the legacy GC path.
-	pooled := false
+	// ── session acquisition (history=false path picks a flow) ──────────────
+	var (
+		chatID        string
+		parID         any
+		reuseLease    *Lease // stealth flow: the checked-out reusable session
+		reuseIsEdit   bool   // stealth flow: true when the request rides an edit
+		reusePromptID any    // stealth flow: message_id the edit targets
+		pooled        bool   // legacy pool flow: retire via pool.Release
+	)
 	useHistory := s.getUseHistory()
 	switch {
 	case useHistory:
@@ -364,16 +408,38 @@ func (s *ProxyServer) handleChat(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-	case s.pool != nil:
-		// Async mode: take a pre-made session from the standing batch so no
-		// per-request creation latency is paid. If the batch is starved (a
-		// burst bigger than the pool) we wait a bounded time and then create
-		// one directly rather than stalling the client indefinitely.
-		id, acqErr := s.pool.Acquire(r.Context(), s.poolWait)
+	case s.sessionFlow.Stealth != nil:
+		lease, acqErr := s.sessionFlow.Stealth.Begin(r.Context())
+		if acqErr != nil {
+			if errors.Is(acqErr, ErrReuseShuttingDown) {
+				writeError(w, "server is shutting down", "server_error", "shutting_down", 503)
+				return
+			}
+			if r.Context().Err() != nil {
+				return // client gone; nothing to answer
+			}
+			writeError(w, acqErr.Error(), "upstream_error", nil, 502)
+			return
+		}
+		chatID = lease.SessionID()
+		reuseLease = lease
+		if mid := lease.MessageIDForEdit(); mid != nil {
+			// The session already carries the first user message: this
+			// request re-edits it instead of appending (the anti-bot reuse
+			// path — no context accumulates, no session churn).
+			reuseIsEdit = true
+			reusePromptID = mid
+		}
+		// else: brand-new session — its first message rides /chat/completion
+		// like a human opening a chat.
+		parID = nil
+	case s.sessionFlow.Pool != nil:
+		// Legacy pool flow: take a pre-made session from the standing batch.
+		id, acqErr := s.sessionFlow.Pool.Acquire(r.Context(), s.poolWait)
 		switch {
 		case acqErr == nil:
 			chatID, pooled = id, true
-			s.log.Printf("Pooled stateless session: %s (%d/%d ready)", chatID, len(s.pool.ready), s.pool.size)
+			s.log.Printf("Pooled stateless session: %s (%d/%d ready)", chatID, len(s.sessionFlow.Pool.ready), s.sessionFlow.Pool.size)
 		case errors.Is(acqErr, ErrPoolTimeout):
 			chatID, err = api.CreateChatSession(context.Background())
 			if err != nil {
@@ -401,46 +467,135 @@ func (s *ProxyServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	s.log.Printf("-> model=%-18s type=%-7s think=%-5v search=%-5v history=%-5v agent=%v",
 		model.ID, model.Type, thinking, search, useHistory, agentMode)
-
-	params := ChatParams{
-		ChatSessionID:   chatID,
-		Prompt:          prompt,
-		ParentMessageID: parID,
-		ThinkingEnabled: thinking,
-		SearchEnabled:   search,
-		ModelType:       string(model.Type),
+	if reuseLease != nil {
+		mode := "first completion"
+		if reuseIsEdit {
+			mode = "edit_message"
+		}
+		s.log.Printf("   reuse session %s: %s (edits left: %d)",
+			chatID, mode, reuseLease.EditsRemaining())
 	}
 
-	if stream {
-		s.streamResponse(w, r, api, params, model.ID)
+	// ── run the completion ─────────────────────────────────────────────
+	// The wire-format writers below are shared by every flow; the runner
+	// closure picks the upstream call (completion vs edit_message).
+	var run upstreamRunner
+	if reuseLease != nil {
+		runner, err2 := s.reuseRunner(api, reuseLease, reuseIsEdit, reusePromptID, prompt, thinking, search, model)
+		if err2 != nil {
+			reuseLease.Abort()
+			writeError(w, err2.Error(), "upstream_error", nil, 502)
+			return
+		}
+		run = runner
+		s.activeLease = reuseLease // observeStreamChunk routes events to it
 	} else {
-		s.blockResponse(w, r, api, params, model.ID)
+		params := ChatParams{
+			ChatSessionID:   chatID,
+			Prompt:          prompt,
+			ParentMessageID: parID,
+			ThinkingEnabled: thinking,
+			SearchEnabled:   search,
+			ModelType:       string(model.Type),
+		}
+		run = func(ctx context.Context, onChunk func(Chunk) bool) error {
+			return api.ChatCompletion(ctx, params, onChunk)
+		}
 	}
 
-	// Session retirement: in history=false mode the session was used only
-	// for this one request. Once the response has been fully written (or the
-	// upstream definitively failed) it will never be referenced again.
-	//
-	// Async mode: pool-owned sessions are retired through the pool, which
-	// deletes the consumed session upstream and immediately creates a
-	// replacement so the standing batch refills. Sessions handed out while
-	// the batch was busy (created on demand) and sync-mode sessions keep the
-	// legacy fire-and-forget GC path.
+	var streamErr error
+	if stream {
+		streamErr = s.streamResponse(w, r, run, model.ID)
+	} else {
+		streamErr = s.blockResponse(w, r, run, model.ID, prompt)
+	}
+	s.activeLease = nil
+
+	// ── session retirement ──────────────────────────────────────────────
+	// Stealth flow: Complete on success (consume one edit; rotate if the
+	// budget is exhausted or the stream reported ban_edit), Abort otherwise.
+	// A mid-stream client hangup (errWriteFailed) still counts as success —
+	// the upstream edit completed; only its relay to the client died.
+	// Legacy pool flow: pool-owned sessions are retired through the pool;
+	// sessions created on demand and sync-mode sessions keep the legacy GC.
+	if reuseLease != nil {
+		switch {
+		case streamErr == nil, errors.Is(streamErr, errWriteFailed):
+			reuseLease.Complete()
+		default:
+			reuseLease.Abort()
+		}
+		return
+	}
 	if !useHistory && chatID != "" {
 		if pooled {
-			s.pool.Release(chatID)
+			s.sessionFlow.Pool.Release(chatID)
 		} else {
 			s.gcSessions("stateless", chatID)
 		}
 	}
 }
 
-func (s *ProxyServer) streamResponse(w http.ResponseWriter, r *http.Request, api *DeepSeekAPI, params ChatParams, model string) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, "Streaming unsupported", "server_error", nil, 500)
-		return
+// upstreamRunner is one stateless completion against the DeepSeek backend:
+// it streams chunks to onChunk (which returns true to stop early) and
+// reports the terminal error. Both /chat/completion and /chat/edit_message
+// implement it, so the OpenAI wire-format writers stay flow-agnostic.
+type upstreamRunner func(ctx context.Context, onChunk func(Chunk) bool) error
+
+// reuseRunner builds the upstream runner for the stealth reuse flow. The
+// very first request on a fresh session uses /chat/completion (a human's
+// first message); every later request re-edits the root message through
+// /chat/edit_message (a human editing their own message — the sanctioned
+// way to reuse a session without persisting context).
+func (s *ProxyServer) reuseRunner(api *DeepSeekAPI, lease *Lease, isEdit bool, msgID any, prompt string, thinking, search bool, model Model) (upstreamRunner, error) {
+	if !isEdit {
+		params := ChatParams{
+			ChatSessionID:   lease.SessionID(),
+			Prompt:          prompt,
+			ParentMessageID: nil,
+			ThinkingEnabled: thinking,
+			SearchEnabled:   search,
+			ModelType:       string(model.Type),
+		}
+		return func(ctx context.Context, onChunk func(Chunk) bool) error {
+			err := api.ChatCompletion(ctx, params, onChunk)
+			if isSessionDeadError(err) {
+				lease.MarkDead()
+			}
+			return err
+		}, nil
 	}
+	if msgID == nil {
+		return nil, APIError{Msg: "reuse: no message id to edit"}
+	}
+	params := EditChatParams{
+		ChatSessionID:   lease.SessionID(),
+		MessageID:       msgID,
+		Prompt:          prompt,
+		ThinkingEnabled: thinking,
+		SearchEnabled:   search,
+	}
+	return func(ctx context.Context, onChunk func(Chunk) bool) error {
+		err := api.EditChatMessage(ctx, params, onChunk)
+		if isSessionDeadError(err) {
+			lease.MarkDead()
+		}
+		return err
+	}, nil
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+// errWriteFailed marks a client-side write failure mid-stream (the client
+// hung up): the response is unrecoverable, but the upstream run was healthy.
+var errWriteFailed = errors.New("client went away mid-stream")
+
+// streamResponse writes the OpenAI streaming wire format for one upstream
+// run. It is flow-agnostic: the runner decides whether the upstream call is
+// /chat/completion or /chat/edit_message. (handleChat pre-checked that the
+// ResponseWriter can flush.)
+func (s *ProxyServer) streamResponse(w http.ResponseWriter, r *http.Request, run upstreamRunner, model string) error {
+	flusher := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "close")
@@ -485,10 +640,8 @@ func (s *ProxyServer) streamResponse(w http.ResponseWriter, r *http.Request, api
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	err := api.ChatCompletion(ctx, params, func(ch Chunk) bool {
-		if ch.Type == "ready" && s.getUseHistory() && ch.ResponseMessageID != nil {
-			s.setHistPar(ch.ResponseMessageID)
-		}
+	err := run(ctx, func(ch Chunk) bool {
+		s.observeStreamChunk(ch)
 		// Thinking deltas ride alongside content as reasoning_content,
 		// matching DeepSeek's own OpenAI-compatible field name.
 		if ch.Type == "reasoning" && ch.Content != "" {
@@ -526,13 +679,13 @@ func (s *ProxyServer) streamResponse(w http.ResponseWriter, r *http.Request, api
 	if err != nil {
 		etype, _ := errorType(err)
 		sse(map[string]any{"error": map[string]any{"message": err.Error(), "type": etype}})
-		return
+		return err
 	}
 
 	if interceptor != nil {
 		final := interceptor.Finish()
 		if final.Content != "" && !sse(contentChunk(final.Content, nil)) {
-			return
+			return errWriteFailed
 		}
 		for _, call := range final.ToolCalls {
 			emittedToolCall = true
@@ -541,7 +694,7 @@ func (s *ProxyServer) streamResponse(w http.ResponseWriter, r *http.Request, api
 				"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
 				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{call}}, "finish_reason": nil}},
 			}) {
-				return
+				return errWriteFailed
 			}
 		}
 	}
@@ -556,6 +709,26 @@ func (s *ProxyServer) streamResponse(w http.ResponseWriter, r *http.Request, api
 	})
 	w.Write([]byte("data: [DONE]\n\n"))
 	flusher.Flush()
+	return nil
+}
+
+// observeStreamChunk routes non-content stream events to whoever needs them
+// today: the reuse lease (message ids, ban_edit) and the history mode's
+// parent-message tracking.
+func (s *ProxyServer) observeStreamChunk(ch Chunk) {
+	switch ch.Type {
+	case "ready":
+		if s.getUseHistory() && ch.ResponseMessageID != nil {
+			s.setHistPar(ch.ResponseMessageID)
+		}
+		if s.activeLease != nil {
+			s.activeLease.ObserveReady(ch.RequestMessageID, ch.ResponseMessageID)
+		}
+	case "ban_edit":
+		if s.activeLease != nil {
+			s.activeLease.ObserveBanEdit()
+		}
+	}
 }
 
 // contentChunkRole is the role-establishing first SSE chunk (required by most
@@ -567,15 +740,15 @@ func contentChunkRole(rid string, created int64, model string) map[string]any {
 	}
 }
 
-func (s *ProxyServer) blockResponse(w http.ResponseWriter, r *http.Request, api *DeepSeekAPI, params ChatParams, model string) {
+// blockResponse writes the OpenAI non-streaming wire format for one upstream
+// run. Flow-agnostic, like streamResponse.
+func (s *ProxyServer) blockResponse(w http.ResponseWriter, r *http.Request, run upstreamRunner, model, prompt string) error {
 	ctx := r.Context()
 	var parts []string
 	var reasoning []string
 
-	err := api.ChatCompletion(ctx, params, func(ch Chunk) bool {
-		if ch.Type == "ready" && s.getUseHistory() && ch.ResponseMessageID != nil {
-			s.setHistPar(ch.ResponseMessageID)
-		}
+	err := run(ctx, func(ch Chunk) bool {
+		s.observeStreamChunk(ch)
 		switch {
 		case ch.Type == "content" && ch.Content != "":
 			parts = append(parts, ch.Content)
@@ -586,9 +759,12 @@ func (s *ProxyServer) blockResponse(w http.ResponseWriter, r *http.Request, api 
 	})
 
 	if err != nil {
+		if errors.Is(err, errWriteFailed) {
+			return err
+		}
 		etype, status := errorType(err)
 		writeError(w, err.Error(), etype, nil, status)
-		return
+		return err
 	}
 
 	answer := strings.Join(parts, "")
@@ -610,7 +786,7 @@ func (s *ProxyServer) blockResponse(w http.ResponseWriter, r *http.Request, api 
 		message["content"] = answer
 	}
 
-	promptTokens := countWords(params.Prompt)
+	promptTokens := countWords(prompt)
 	completionTokens := countWords(answer)
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -629,6 +805,7 @@ func (s *ProxyServer) blockResponse(w http.ResponseWriter, r *http.Request, api 
 			"total_tokens":      promptTokens + completionTokens,
 		},
 	})
+	return nil
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

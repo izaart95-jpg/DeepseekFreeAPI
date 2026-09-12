@@ -15,7 +15,9 @@ import (
 	"strings"
 )
 
-const deepseekBaseURL = "https://chat.deepseek.com/api/v0"
+// deepseekBaseURL is the upstream API root. A var (not const) so tests can
+// redirect the client at a fake upstream.
+var deepseekBaseURL = "https://chat.deepseek.com/api/v0"
 
 const deepseekUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 
@@ -234,8 +236,15 @@ func (c *DeepSeekAPI) makeRequest(ctx context.Context, method, endpoint string, 
 
 // GetPowChallenge fetches a fresh PoW challenge from the API.
 func (c *DeepSeekAPI) GetPowChallenge(ctx context.Context) (*Challenge, error) {
+	return c.getPowChallengeFor(ctx, "/chat/completion")
+}
+
+// getPowChallengeFor fetches a PoW challenge for a specific target path.
+// The edit_message endpoint requires its own challenge (target_path is
+// part of the signed PoW payload), so the path must be caller-chosen.
+func (c *DeepSeekAPI) getPowChallengeFor(ctx context.Context, targetPath string) (*Challenge, error) {
 	resp, err := c.makeRequest(ctx, "POST", "/chat/create_pow_challenge",
-		map[string]any{"target_path": "/api/v0/chat/completion"}, false)
+		map[string]any{"target_path": "/api/v0" + targetPath}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -348,6 +357,40 @@ func BuildChatCompletionBody(params ChatParams) map[string]any {
 	return body
 }
 
+// EditChatParams mirror the JSON body of /chat/edit_message (the web client's
+// "edit message" flow). MessageID is the user message being re-edited.
+type EditChatParams struct {
+	ChatSessionID   string
+	MessageID       any
+	Prompt          string
+	ThinkingEnabled bool
+	SearchEnabled   bool
+	ModelType       string
+}
+
+// BuildEditMessageBody renders the JSON payload POSTed to DeepSeek's
+// /chat/edit_message, mirroring the web client exactly:
+//
+//	{"chat_session_id":..., "message_id":1, "ref_file_ids":[],
+//	 "prompt":..., "search_enabled":false, "thinking_enabled":false,
+//	 "action":null}
+//
+// The model_type key is deliberately omitted: the web client does not send it
+// for edit_message (the session's model class carries over), and sending
+// unknown keys can flag the request as a non-browser client.
+func BuildEditMessageBody(params EditChatParams) map[string]any {
+	body := map[string]any{
+		"chat_session_id":  params.ChatSessionID,
+		"message_id":       asU32(params.MessageID),
+		"ref_file_ids":     []any{},
+		"prompt":           params.Prompt,
+		"search_enabled":   params.SearchEnabled,
+		"thinking_enabled": params.ThinkingEnabled,
+		"action":           nil,
+	}
+	return body
+}
+
 // ChatCompletion streams chunks to onChunk (port of api.py chat_completion).
 // onChunk returns true to stop early (e.g. on FINISHED).
 func (c *DeepSeekAPI) ChatCompletion(ctx context.Context, params ChatParams, onChunk func(Chunk) bool) error {
@@ -358,7 +401,32 @@ func (c *DeepSeekAPI) ChatCompletion(ctx context.Context, params ChatParams, onC
 		return fmt.Errorf("Chat session ID must be a non-empty string")
 	}
 
-	challenge, err := c.GetPowChallenge(ctx)
+	jsonData := BuildChatCompletionBody(params)
+	return c.streamCompletion(ctx, "/chat/completion", jsonData, onChunk)
+}
+
+// EditChatMessage streams chunks to onChunk by re-editing message_id in the
+// given chat session (port of the web client's edit_message flow). The model
+// sees the edited prompt as a fresh turn: re-editing the same message never
+// builds persisted context, so a session can serve many stateless requests.
+func (c *DeepSeekAPI) EditChatMessage(ctx context.Context, params EditChatParams, onChunk func(Chunk) bool) error {
+	if params.Prompt == "" {
+		return fmt.Errorf("Prompt must be a non-empty string")
+	}
+	if params.ChatSessionID == "" {
+		return fmt.Errorf("Chat session ID must be a non-empty string")
+	}
+
+	jsonData := BuildEditMessageBody(params)
+	return c.streamCompletion(ctx, "/chat/edit_message", jsonData, onChunk)
+}
+
+// streamCompletion POSTs jsonData to the given chat endpoint (after solving
+// the PoW challenge for its target path) and streams the SSE response,
+// feeding every parsed chunk to onChunk until FINISHED/EOF/error. It is the
+// shared engine of both /chat/completion and /chat/edit_message.
+func (c *DeepSeekAPI) streamCompletion(ctx context.Context, targetPath string, jsonData map[string]any, onChunk func(Chunk) bool) error {
+	challenge, err := c.getPowChallengeFor(ctx, targetPath)
 	if err != nil {
 		return err
 	}
@@ -371,14 +439,12 @@ func (c *DeepSeekAPI) ChatCompletion(ctx context.Context, params ChatParams, onC
 		debugf("pow response: %s", powResponse)
 	}
 
-	jsonData := BuildChatCompletionBody(params)
-
 	body, err := json.Marshal(jsonData)
 	if err != nil {
 		return APIError{Msg: fmt.Sprintf("Request marshal failed: %v", err)}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", deepseekBaseURL+"/chat/completion", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", deepseekBaseURL+targetPath, bytes.NewReader(body))
 	if err != nil {
 		return NetworkError{Msg: fmt.Sprintf("Network error occurred during streaming: %v", err)}
 	}
@@ -387,7 +453,7 @@ func (c *DeepSeekAPI) ChatCompletion(ctx context.Context, params ChatParams, onC
 		req.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
 	if debugMode {
-		debugDumpOutgoingRequest("POST", deepseekBaseURL+"/chat/completion", req.Header, body)
+		debugDumpOutgoingRequest("POST", deepseekBaseURL+targetPath, req.Header, body)
 	}
 
 	resp, err := c.client.Do(req)
@@ -527,6 +593,13 @@ func parseStreamData(data map[string]any, st *streamState) ([]Chunk, bool, error
 
 	if v, ok := data["v"].(map[string]any); ok {
 		if response, ok := v["response"].(map[string]any); ok {
+			// ban_edit=true means the paired user message can no longer be
+			// edited (edit budget exhausted). Surface it as its own chunk so
+			// the reuse manager can rotate the session; it never reaches
+			// clients (only content/reasoning chunks are forwarded).
+			if be, ok := response["ban_edit"].(bool); ok && be {
+				chunks = append(chunks, Chunk{Type: "ban_edit"})
+			}
 			if fragments, ok := response["fragments"].([]any); ok {
 				for _, frag := range fragments {
 					f, ok := frag.(map[string]any)
